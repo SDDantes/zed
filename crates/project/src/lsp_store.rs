@@ -13173,6 +13173,57 @@ impl LspStore {
         Task::ready(())
     }
 
+    fn handle_unexpected_language_server_exit(
+        &mut self,
+        server_id: LanguageServerId,
+        cx: &mut Context<Self>,
+    ) {
+        let is_running = self.as_local().is_some_and(|local| {
+            matches!(
+                local.language_servers.get(&server_id),
+                Some(LanguageServerState::Running { .. })
+            )
+        });
+        if !is_running {
+            // The server was already stopped or restarted, which removes it from
+            // `language_servers` before shutting the process down.
+            return;
+        }
+
+        let Some(status) = self.language_server_statuses.get(&server_id) else {
+            return;
+        };
+        let name = status.name.clone();
+        let Some(worktree_id) = status.worktree else {
+            return;
+        };
+
+        cx.emit(LspStoreEvent::Notification(format!(
+            "The {name} language server exited unexpectedly. \
+             Restart it from the language server menu."
+        )));
+
+        let stop_task = self.stop_local_language_server(server_id, true, cx);
+        cx.spawn(async move |lsp_store, cx| {
+            stop_task.await;
+            lsp_store
+                .update(cx, |lsp_store, cx| {
+                    if let Some(local) = lsp_store.as_local() {
+                        local.update_binary_status(BinaryStatusUpdate {
+                            name,
+                            worktree_id,
+                            binary_status: BinaryStatus::Failed {
+                                error: "process exited unexpectedly".to_string(),
+                            },
+                        });
+                    }
+                    cx.notify();
+                })
+                .ok();
+        })
+        .detach();
+    }
+
     pub fn stop_all_language_servers(&mut self, cx: &mut Context<Self>) {
         if let Some(local) = self.as_local_mut() {
             local.all_language_servers_stopped = true;
@@ -13825,6 +13876,23 @@ impl LspStore {
             worktree_id: key.worktree_id,
             binary_status: BinaryStatus::None,
         });
+
+        let (exit_tx, exit_rx) = smol::channel::bounded::<()>(1);
+        language_server.on_unexpected_exit(Box::new(move || {
+            exit_tx.try_send(()).ok();
+        }));
+        cx.spawn(async move |lsp_store, cx| {
+            // The sender is consumed by the single callback invocation, so the loop
+            // ends once the channel is closed.
+            while exit_rx.recv().await.is_ok() {
+                lsp_store
+                    .update(cx, |lsp_store, cx| {
+                        lsp_store.handle_unexpected_language_server_exit(server_id, cx);
+                    })
+                    .ok();
+            }
+        })
+        .detach();
 
         if let Some(file_ops_caps) = language_server
             .capabilities()
@@ -15488,6 +15556,20 @@ fn language_server_id_for_binary_status(
                     (status.worktree == Some(worktree_id) && status.name == *language_server_name)
                         .then_some(*server_id)
                 })
+        })
+        .or_else(|| {
+            // Servers stopped with a retained status are no longer in the maps above,
+            // but their id is kept so late binary status updates can still be
+            // attributed to them.
+            lsp_store.as_local().and_then(|local| {
+                local
+                    .stopped_server_ids_to_names_and_worktrees
+                    .iter()
+                    .find_map(|(server_id, (name, worktree_ids))| {
+                        (*name == *language_server_name && worktree_ids.contains(&worktree_id))
+                            .then_some(*server_id)
+                    })
+            })
         })
 }
 

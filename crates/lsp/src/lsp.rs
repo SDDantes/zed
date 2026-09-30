@@ -34,7 +34,7 @@ use std::{
     pin::Pin,
     sync::{
         Arc, Weak,
-        atomic::{AtomicI32, Ordering::SeqCst},
+        atomic::{AtomicBool, AtomicI32, Ordering, Ordering::SeqCst},
     },
     task::Poll,
     time::{Duration, Instant},
@@ -136,6 +136,10 @@ pub struct LanguageServer {
     executor: BackgroundExecutor,
     #[allow(clippy::type_complexity)]
     io_tasks: Mutex<Option<(Task<Option<()>>, Task<Option<()>>)>>,
+    /// Set as soon as `shutdown` is called, so that I/O tasks completing afterwards can be
+    /// attributed to an intentional shutdown instead of an unexpected process exit.
+    shutdown_started: Arc<AtomicBool>,
+    unexpected_exit_callbacks: Arc<Mutex<Vec<Box<dyn FnOnce() + Send>>>>,
     output_done_rx: Mutex<Option<barrier::Receiver>>,
     server: Arc<Mutex<Option<Child>>>,
     workspace_folders: Option<Arc<Mutex<BTreeSet<Uri>>>>,
@@ -660,6 +664,21 @@ impl LanguageServer {
             let (stdout, stderr) = futures::join!(stdout_input_task, stderr_input_task);
             stdout.or(stderr)
         });
+        let shutdown_started = Arc::new(AtomicBool::new(false));
+        let unexpected_exit_callbacks: Arc<Mutex<Vec<Box<dyn FnOnce() + Send>>>> = Arc::default();
+        let input_task = {
+            let shutdown_started = shutdown_started.clone();
+            let unexpected_exit_callbacks = unexpected_exit_callbacks.clone();
+            cx.background_spawn(async move {
+                let result = input_task.await;
+                if !shutdown_started.load(Ordering::Relaxed) {
+                    for callback in unexpected_exit_callbacks.lock().drain(..) {
+                        callback();
+                    }
+                }
+                result
+            })
+        };
         let output_task = cx.background_spawn({
             Self::handle_outgoing_messages(
                 stdin,
@@ -713,6 +732,8 @@ impl LanguageServer {
             outbound_tx,
             executor: cx.background_executor().clone(),
             io_tasks: Mutex::new(Some((input_task, output_task))),
+            shutdown_started,
+            unexpected_exit_callbacks,
             output_done_rx: Mutex::new(Some(output_done_rx)),
             server: Arc::new(Mutex::new(server)),
             workspace_folders,
@@ -1197,6 +1218,7 @@ impl LanguageServer {
 
     /// Sends a shutdown request to the language server process and prepares the [`LanguageServer`] to be dropped.
     pub fn shutdown(&self) -> Option<impl 'static + Send + Future<Output = Option<()>> + use<>> {
+        self.shutdown_started.store(true, Ordering::Relaxed);
         let tasks = self.io_tasks.lock().take()?;
 
         let response_handlers = self.response_handlers.clone();
@@ -1265,6 +1287,13 @@ impl LanguageServer {
             log::debug!("language server shutdown finished");
             Some(())
         })
+    }
+
+    /// Registers a callback that is invoked at most once, on a background thread, when the
+    /// language server's I/O tasks end without [`Self::shutdown`] having been called, e.g.
+    /// because the process exited unexpectedly.
+    pub fn on_unexpected_exit(&self, callback: Box<dyn FnOnce() + Send>) {
+        self.unexpected_exit_callbacks.lock().push(callback);
     }
 
     /// Register a handler to handle incoming LSP notifications.
@@ -2661,5 +2690,65 @@ mod tests {
 
     fn framed_test_message(payload: &str) -> Vec<u8> {
         format!("Content-Length: {}\r\n\r\n{payload}", payload.len()).into_bytes()
+    }
+
+    #[gpui::test]
+    async fn unexpected_exit_fires_callback(cx: &mut TestAppContext) {
+        let (server, fake) = FakeLanguageServer::new(
+            LanguageServerId(0),
+            LanguageServerBinary {
+                path: "path/to/language-server".into(),
+                arguments: vec![],
+                env: None,
+            },
+            "the-lsp".to_string(),
+            Default::default(),
+            &mut cx.to_async(),
+        );
+        let (exit_tx, exit_rx) = async_channel::bounded::<()>(1);
+        server.on_unexpected_exit(Box::new(move || {
+            exit_tx.try_send(()).ok();
+        }));
+
+        // Dropping the fake language server closes its end of the pipes, which the
+        // real server observes as the process dying (stdout EOF).
+        drop(fake);
+        cx.run_until_parked();
+
+        assert_eq!(
+            exit_rx.try_recv(),
+            Ok(()),
+            "the unexpected exit callback should fire when I/O ends without a shutdown"
+        );
+    }
+
+    #[gpui::test]
+    async fn shutdown_does_not_fire_exit_callback(cx: &mut TestAppContext) {
+        let (server, _fake) = FakeLanguageServer::new(
+            LanguageServerId(0),
+            LanguageServerBinary {
+                path: "path/to/language-server".into(),
+                arguments: vec![],
+                env: None,
+            },
+            "the-lsp".to_string(),
+            Default::default(),
+            &mut cx.to_async(),
+        );
+        let (exit_tx, exit_rx) = async_channel::bounded::<()>(1);
+        server.on_unexpected_exit(Box::new(move || {
+            exit_tx.try_send(()).ok();
+        }));
+
+        let shutdown = server
+            .shutdown()
+            .expect("first shutdown call should return a future");
+        shutdown.await;
+        cx.run_until_parked();
+
+        assert!(
+            exit_rx.try_recv().is_err(),
+            "an intentional shutdown should not fire the unexpected exit callback"
+        );
     }
 }

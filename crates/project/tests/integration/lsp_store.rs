@@ -1329,6 +1329,104 @@ async fn test_stopped_server_logs_are_not_transferred_between_projects(
     });
 }
 
+/// A language server whose process dies unexpectedly triggers a toast, gets
+/// cleaned up, and stays listed as stopped so it can be restarted (#62797).
+#[gpui::test]
+async fn crashed_server_notifies_and_cleans_up(cx: &mut TestAppContext) {
+    init_test(cx);
+    cx.executor().allow_parking();
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/the-root"), json!({ "main.rs": "fn main() {}" }))
+        .await;
+    let project = Project::test(fs, [path!("/the-root").as_ref()], cx).await;
+    let language_registry = project.read_with(cx, |project, _| project.languages().clone());
+    language_registry.add(rust_lang());
+    let mut fake_servers = language_registry.register_fake_lsp("Rust", FakeLspAdapter::default());
+    let (mut binary_statuses, _binary_statuses_subscription) =
+        language_registry.language_server_binary_statuses();
+
+    let (buffer, _) = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer_with_lsp(path!("/the-root/main.rs"), cx)
+        })
+        .await
+        .unwrap();
+    let fake_server = fake_servers.next().await.unwrap();
+    cx.run_until_parked();
+
+    let lsp_store = project.read_with(cx, |project, _| project.lsp_store());
+    let (server_id, server_name, worktree_id) = lsp_store.read_with(cx, |store, cx| {
+        let (server_id, status) = store.language_server_statuses().next().unwrap();
+        (
+            server_id,
+            status.name.clone(),
+            buffer.read_with(cx, |buffer, cx| buffer.file().unwrap().worktree_id(cx)),
+        )
+    });
+
+    let notifications = Arc::new(Mutex::new(Vec::new()));
+    lsp_store.update(cx, |_, cx| {
+        let notifications = notifications.clone();
+        cx.subscribe(&lsp_store, move |_, _, event: &LspStoreEvent, _| {
+            if let LspStoreEvent::Notification(message) = event {
+                notifications.lock().push(message.clone());
+            }
+        })
+        .detach();
+    });
+
+    // Simulate the process dying: dropping the fake server and replacing the
+    // registry's fake entry releases the last references, closing the pipes
+    // the real server reads.
+    drop(fake_server);
+    language_registry.register_fake_lsp_server(
+        LanguageServerName("the-fake-language-server".into()),
+        lsp::LanguageServer::full_capabilities(),
+        None,
+    );
+    cx.run_until_parked();
+
+    assert!(
+        notifications
+            .lock()
+            .iter()
+            .any(|message| message.contains("exited unexpectedly")),
+        "a toast should notify about the crash, got {:?}",
+        notifications.lock()
+    );
+
+    let mut saw_failed_status = false;
+    while let Ok((_, update)) = binary_statuses.try_recv() {
+        if update.name == server_name
+            && update.worktree_id == worktree_id
+            && matches!(update.binary_status, language::BinaryStatus::Failed { .. })
+        {
+            saw_failed_status = true;
+        }
+    }
+    assert!(
+        saw_failed_status,
+        "the crashed server should report a Failed binary status"
+    );
+
+    lsp_store.read_with(cx, |store, _| {
+        assert!(
+            !store
+                .language_server_statuses()
+                .any(|(status_server_id, _)| status_server_id == server_id),
+            "the crashed server's status entry should be cleaned up"
+        );
+        assert!(
+            store
+                .stopped_language_servers()
+                .get(&server_name)
+                .is_some_and(|worktree_ids| worktree_ids.contains(&worktree_id)),
+            "the crashed server should stay listed as stopped for its worktree"
+        );
+    });
+}
+
 async fn project_with_rust_server(
     fs: Arc<FakeFs>,
     root: &str,

@@ -160,6 +160,11 @@ struct LanguageServers {
     health_statuses: HashMap<LanguageServerId, LanguageServerHealthStatus>,
     binary_statuses: HashMap<LanguageServerId, LanguageServerBinaryStatus>,
     servers_per_buffer_abs_path: HashMap<PathBuf, ServersForPath>,
+    /// Servers that crashed while running: (name, worktree) -> (dead server id, error).
+    /// Keyed by name and worktree (not id) so the failure outlives the dead id and is
+    /// cleared when a new server for the same slot starts.
+    failed_stopped_servers:
+        HashMap<(LanguageServerName, WorktreeId), (LanguageServerId, SharedString)>,
 }
 
 #[derive(Debug, Clone)]
@@ -339,6 +344,7 @@ impl LanguageServerState {
             } else if let LspMenuItem::WithStoppedStatus {
                 server_name,
                 worktree_id,
+                error,
             } = item
             {
                 let server_name = server_name.clone();
@@ -370,9 +376,14 @@ impl LanguageServerState {
                 menu = menu.submenu_with_colored_icon(
                     server_name.0.clone(),
                     IconName::Circle,
-                    Color::Disabled,
+                    if error.is_some() {
+                        Color::Error
+                    } else {
+                        Color::Disabled
+                    },
                     {
                         let state = state.clone();
+                        let error = error.clone();
                         let server_name = server_name.clone();
                         let workspace = workspace.clone();
                         let lsp_logs = lsp_logs.clone();
@@ -380,6 +391,9 @@ impl LanguageServerState {
                         let project = project.clone();
                         move |menu, _window, _cx| {
                             let mut submenu = menu;
+                            if let Some(error) = error.clone() {
+                                submenu = submenu.header(error);
+                            }
                             let state_for_restart = state.clone();
                             let server_name_for_restart = server_name.clone();
                             submenu = submenu.entry("Restart Server", None, move |_window, cx| {
@@ -898,6 +912,7 @@ enum ServerData<'a> {
     WithStoppedStatus {
         server_name: &'a LanguageServerName,
         worktree_id: WorktreeId,
+        error: Option<&'a SharedString>,
     },
 }
 
@@ -918,6 +933,7 @@ enum LspMenuItem {
     WithStoppedStatus {
         server_name: LanguageServerName,
         worktree_id: WorktreeId,
+        error: Option<SharedString>,
     },
     ToggleServersButton {
         restart: bool,
@@ -999,9 +1015,11 @@ impl ServerData<'_> {
             Self::WithStoppedStatus {
                 server_name,
                 worktree_id,
+                error,
             } => LspMenuItem::WithStoppedStatus {
                 server_name: server_name.clone(),
                 worktree_id,
+                error: error.cloned(),
             },
         }
     }
@@ -1116,6 +1134,34 @@ impl LspButton {
                             }
                         };
                         self.server_state.update(cx, |state, _| {
+                            // Track crashes of stopped servers by name and worktree, so the
+                            // failure is visible on the stopped row and cleared when a new
+                            // server for the same slot reports a non-failed status.
+                            if let (Some(name), Some(worktree_id)) = (
+                                name.as_ref(),
+                                status_update.worktree_id.map(WorktreeId::from_proto),
+                            ) {
+                                match &binary_status {
+                                    BinaryStatus::Failed { error } => {
+                                        state.language_servers.failed_stopped_servers.insert(
+                                            (name.clone(), worktree_id),
+                                            (*language_server_id, SharedString::new(error.clone())),
+                                        );
+                                    }
+                                    _ => {
+                                        if let Some((dead_server_id, _)) = state
+                                            .language_servers
+                                            .failed_stopped_servers
+                                            .remove(&(name.clone(), worktree_id))
+                                        {
+                                            state
+                                                .language_servers
+                                                .binary_statuses
+                                                .remove(&dead_server_id);
+                                        }
+                                    }
+                                }
+                            }
                             state.language_servers.update_binary_status(
                                 binary_status,
                                 status_update.message.as_deref(),
@@ -1312,12 +1358,18 @@ impl LspButton {
                                 .read(cx)
                                 .worktree_for_id(*worktree_id, cx)
                             {
+                                let error = state
+                                    .language_servers
+                                    .failed_stopped_servers
+                                    .get(&(server_name.clone(), *worktree_id))
+                                    .map(|(_, error)| error);
                                 let worktree_name =
                                     SharedString::new(worktree.read(cx).root_name_str());
                                 servers_per_worktree.entry(worktree_name).or_default().push(
                                     ServerData::WithStoppedStatus {
                                         server_name,
                                         worktree_id: *worktree_id,
+                                        error,
                                     },
                                 );
                             }
